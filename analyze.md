@@ -13,12 +13,14 @@ Perform a deterministic static code analysis of the current directory. Follow ev
 4. **Omit uncertainty** — if a finding is ambiguous or you are not confident, omit it rather than guess
 5. **Fixed file filter** — only analyze source files matching the extensions listed in Step 1
 6. **No subagents** — process files sequentially in the order listed; do not parallelize
+7. **No git state** — do not read git history, branch names, diff output, or any git metadata
+8. **Context limit guard** — if the file list from Step 1 contains more than 200 files, stop and output only this JSON: `{"error": "too_many_files", "count": <actual count>, "limit": 200}`
 
 ## Step 1: Discover Source Files
 
 Run this exact command and use its output as your file list:
 
-!`find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.rb" -o -name "*.swift" -o -name "*.c" -o -name "*.cpp" -o -name "*.h" \) | grep -v -E "(node_modules|\.git|dist|build|\.next|__pycache__|\.cache|\.turbo|coverage)" | sort`
+!`LC_ALL=C find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" -o -name "*.py" -o -name "*.go" -o -name "*.rs" -o -name "*.java" -o -name "*.rb" -o -name "*.swift" -o -name "*.c" -o -name "*.cpp" -o -name "*.h" \) | grep -v -E "(node_modules|\.git|dist|build|\.next|__pycache__|\.cache|\.turbo|coverage)" | LC_ALL=C sort`
 
 Read each file in the exact order listed above. Do not read files in any other order.
 

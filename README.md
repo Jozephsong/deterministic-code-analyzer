@@ -1,6 +1,6 @@
 # deterministic-code-analyzer
 
-An [opencode](https://opencode.ai) command that performs **static code analysis with deterministic output** — running the same command on the same codebase always produces byte-identical JSON.
+An [opencode](https://opencode.ai) command that performs **static code analysis with maximally deterministic output** — applying every known technique to produce the same JSON on every run against the same codebase.
 
 ## Quick Start
 
@@ -22,6 +22,12 @@ LLMs are stochastic by default. Even with `temperature: 0`, output can vary due 
 | Date/time in prompt | "today" resolves differently across days |
 | Parallel subagents | Race conditions in result merging |
 | Ambiguous instructions | LLM fills gaps differently each time |
+| Locale-dependent sort | `sort` without `LC_ALL=C` orders differently per system |
+| No seed parameter | Anthropic API has no `seed` — temperature=0 is best-effort, not guaranteed |
+| opencode harness updates | System prompt injected by opencode changes when opencode is updated |
+| Context window overflow | Truncation point varies when input exceeds context limit |
+| Git state leakage | Branch name, diff, or uncommitted changes contaminate context |
+| Byte-level test comparison | Semantically identical JSON fails diff due to whitespace or `1` vs `1.0` |
 
 ## How This Command Achieves Determinism
 
@@ -41,9 +47,9 @@ The prompt enforces a strict schema with no prose allowed before or after. There
 Output ONLY the following JSON. Nothing else.
 ```
 
-### 3. Deterministic File Ordering
+### 3. Locale-Pinned File Ordering
 
-Files are discovered with `find ... | sort`, which produces stable alphabetical order on any POSIX system. The prompt instructs the model to read files in the exact listed order with no parallelism.
+Files are discovered with `LC_ALL=C find ... | LC_ALL=C sort`. The `LC_ALL=C` prefix is critical: without it, `sort` uses the system locale and orders differently across machines (e.g., case sensitivity, special characters). `LC_ALL=C` forces byte-order sorting, which is identical everywhere. The prompt also instructs the model to read files in the exact listed order with no parallelism.
 
 ### 4. No Temporal References
 
@@ -66,6 +72,25 @@ The prompt explicitly disables subagent parallelism (`do not parallelize`), whic
 ### 7. Objective-Only Issue Rules
 
 Issues are defined as pattern matches against a fixed, closed list of rules (`todo_fixme`, `hardcoded_secret`, `long_function`, `unused_import`). There is no open-ended "find any problems" instruction that would produce different findings each run.
+
+### 8. No Git State
+
+The prompt explicitly prohibits reading git metadata (history, branch, diff). Git state changes frequently and is a common contamination source when agents are run mid-development.
+
+### 9. Context Window Guard
+
+If more than 200 files are discovered, the command stops immediately and returns a structured error instead of silently truncating. Truncation at different points in a large file list is a hidden source of variance.
+
+### 10. Semantic JSON Comparison for Testing
+
+`temperature: 0` with Anthropic's API is best-effort — there is no `seed` parameter, and floating-point differences across GPU inference runs can occasionally flip a token. Always compare output semantically, not by byte diff:
+
+```bash
+# Canonical comparison (not byte diff)
+jq --sort-keys '.' output_run1.json > canon1.json
+jq --sort-keys '.' output_run2.json > canon2.json
+diff canon1.json canon2.json
+```
 
 ## Output Schema
 
@@ -148,6 +173,7 @@ The following directories are automatically excluded from analysis:
 
 ## Caveats
 
-- `temperature: 0` reduces but does not eliminate variance. Long outputs or ambiguous patterns may still produce minor differences between runs.
-- Rotating to a new model version resets the baseline — re-verify determinism after any model change.
-- The `unused_import` rule relies on the LLM's text-search reasoning and may have false positives on re-exported or dynamically accessed identifiers.
+- **temperature=0 is not a hard guarantee.** Anthropic's API has no `seed` parameter. Floating-point differences across GPU inference instances can occasionally produce different tokens when two candidates have near-equal probability. Compare outputs semantically (see Section 10 above), not byte-for-byte.
+- **opencode harness updates reset the baseline.** opencode injects its own system prompt before your command runs. If opencode is updated, its system prompt may change, which can shift model behavior. Re-verify determinism after any opencode update.
+- **Rotating to a new model version resets the baseline.** Re-run on a reference codebase and establish a new expected output after any model change.
+- **The `unused_import` rule may have false positives** on re-exported or dynamically accessed identifiers, since it relies on the LLM's text-search reasoning rather than a real AST parser.
