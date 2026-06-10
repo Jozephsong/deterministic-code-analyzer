@@ -171,6 +171,107 @@ The following directories are automatically excluded from analysis:
 !`find ${ARGUMENTS:-.} -type f ...`
 ```
 
+## GPU / Inference Server Determinism
+
+If you are self-hosting the model (e.g., via vLLM) rather than using the Anthropic API, there are additional sources of non-determinism at the GPU and inference-server layers.
+
+### CUDA / PyTorch Environment Variables
+
+Set these before launching the inference server:
+
+```bash
+# Deterministic cuBLAS matrix operations (most impactful)
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+# Fix Python hash randomization (affects dict ordering etc.)
+export PYTHONHASHSEED=0
+
+# Deterministic NCCL all-reduce (multi-GPU only)
+export NCCL_DETERMINISTIC=1
+export TORCH_NCCL_USE_COMM_NONBLOCKING=0
+```
+
+In PyTorch code:
+
+```python
+import torch
+
+torch.use_deterministic_algorithms(True)    # raises error if non-deterministic op is used
+torch.backends.cudnn.deterministic = True   # force deterministic cuDNN algorithms
+torch.backends.cudnn.benchmark = False      # disable auto-tuning (changes algorithm per input shape)
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+```
+
+> `cudnn.benchmark = True` is often a default in model repos. Leaving it on means a different convolution algorithm may be selected depending on input shape, producing different outputs.
+
+### vLLM Batch Processing Non-Determinism
+
+vLLM uses **continuous batching**: requests that arrive at similar times are grouped into a single forward pass. This is a real source of non-determinism even at temperature=0.
+
+**Why batching changes output:**
+
+```
+Request A alone:      [tok_A1, tok_A2, PAD,   PAD,   PAD  ]
+Request A with B:     [tok_A1, tok_A2, tok_B1, tok_B2, tok_B3]
+```
+
+The same request A produces different attention computation patterns depending on what it is batched with. Flash Attention is not bit-exact across different padding configurations, so the output token distribution shifts slightly — enough to change the selected token under greedy decoding.
+
+**vLLM launch flags:**
+
+```bash
+vllm serve <model> \
+  --seed 42 \
+  --enforce-eager \                  # disable CUDA graph capture
+  --disable-custom-all-reduce        # use standard NCCL (more deterministic)
+```
+
+**Fixing batch composition (most effective approach):**
+
+```python
+from vllm import LLM, SamplingParams
+
+llm = LLM(
+    model="...",
+    seed=42,
+    enforce_eager=True,
+    max_num_seqs=1,       # process one request at a time — eliminates batch variance
+)
+```
+
+`max_num_seqs=1` eliminates batch-composition variance entirely but reduces throughput. If throughput matters, the practical compromise is to **sort inputs by length** before submission so that batch composition is always identical for the same input set:
+
+```python
+prompts_sorted = sorted(prompts, key=len)
+outputs = llm.generate(prompts_sorted, SamplingParams(temperature=0, seed=42))
+```
+
+**Flash Attention vs xFormers:**
+
+Flash Attention has known non-determinism under certain padding configurations. Switching to xFormers can help:
+
+```bash
+export VLLM_ATTENTION_BACKEND=XFORMERS
+```
+
+### Multi-GPU (Tensor Parallelism)
+
+All-reduce operations sum floating-point values across GPUs in a hardware-dependent order. The result differs from single-GPU inference and differs across different numbers of GPUs. **Keep the number of GPUs fixed** across runs to maintain consistent output.
+
+### Summary Table
+
+| Layer | Setting | Impact |
+|-|-|-|
+| CUDA | `CUBLAS_WORKSPACE_CONFIG=:4096:8` | High |
+| PyTorch | `cudnn.deterministic=True`, `benchmark=False` | High |
+| vLLM batching | Sort inputs by length, or `max_num_seqs=1` | High |
+| vLLM launch | `--seed 42 --enforce-eager` | Medium |
+| Multi-GPU | Fix GPU count, `NCCL_DETERMINISTIC=1` | High |
+| Python | `PYTHONHASHSEED=0` | Low |
+
+---
+
 ## Caveats
 
 - **temperature=0 is not a hard guarantee.** Anthropic's API has no `seed` parameter. Floating-point differences across GPU inference instances can occasionally produce different tokens when two candidates have near-equal probability. Compare outputs semantically (see Section 10 above), not byte-for-byte.
